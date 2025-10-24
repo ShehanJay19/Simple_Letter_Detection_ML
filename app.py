@@ -9,3 +9,6 @@ app = Flask(__name__)
 def home():
     return render_template('index.html')
 
+@app.route('/write')
+def write():
+    return render_template('write.html')
