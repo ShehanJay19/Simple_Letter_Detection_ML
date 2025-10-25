@@ -11,6 +11,7 @@
     #draw-pad { background: #fff; border: 1px solid #dee2e6; border-radius: .25rem; touch-action: none; }
     .controls { gap: .5rem; }
     .result { min-height: 3.5rem; border-radius: .25rem; padding: .75rem; background: #fff; border: 1px solid #e9ecef; }
+    .small-preview { width: 80px; height: 40px; border:1px solid #ddd; background:#fff; object-fit:contain; }
   </style>
 </head>
 <body>
@@ -29,6 +30,7 @@
         <div class="d-flex justify-content-between align-items-center mb-2">
           <div class="d-flex controls">
             <button id="clearBtn" class="btn btn-sm btn-outline-secondary">Clear</button>
+            <button id="startWriteBtn" class="btn btn-sm btn-primary">Write a Letter</button>
             <label class="btn btn-sm btn-outline-secondary mb-0">
               Stroke
               <input id="strokeRange" type="range" min="1" max="30" value="12" style="display:none">
@@ -39,8 +41,14 @@
 
         <canvas id="draw-pad" width="560" height="280" class="w-100"></canvas>
 
-        <div class="d-flex justify-content-end mt-3">
-          <button id="submitBtn" class="btn btn-primary">Submit for Detection</button>
+        <div class="d-flex justify-content-between align-items-center mt-3">
+          <div class="d-flex align-items-center gap-2">
+            <img id="previewSmall" class="small-preview" alt="preview">
+            <small class="text-muted">Sending small preview (8×8) to model</small>
+          </div>
+          <div>
+            <button id="submitBtn" class="btn btn-primary">Submit for Detection</button>
+          </div>
         </div>
       </div>
     </div>
@@ -55,23 +63,29 @@
     const canvas = document.getElementById('draw-pad');
     const ctx = canvas.getContext('2d');
     const clearBtn = document.getElementById('clearBtn');
+    const startWriteBtn = document.getElementById('startWriteBtn');
     const submitBtn = document.getElementById('submitBtn');
     const resultEl = document.getElementById('resultContent');
     const strokeRange = document.getElementById('strokeRange');
+    const previewSmall = document.getElementById('previewSmall');
 
     // scale canvas for high-DPI screens
     function resizeCanvasForHiDPI() {
       const ratio = window.devicePixelRatio || 1;
-      const w = canvas.clientWidth;
-      const h = canvas.clientHeight;
+      const w = canvas.clientWidth || 560;
+      const h = canvas.clientHeight || 280;
       if (canvas.width !== w * ratio || canvas.height !== h * ratio) {
-        const image = ctx.getImageData(0,0,canvas.width,canvas.height);
+        // preserve drawing if any
+        const temp = document.createElement('canvas');
+        temp.width = canvas.width;
+        temp.height = canvas.height;
+        temp.getContext('2d').drawImage(canvas, 0, 0);
         canvas.width = w * ratio;
         canvas.height = h * ratio;
         canvas.style.width = w + 'px';
         canvas.style.height = h + 'px';
         ctx.scale(ratio, ratio);
-        ctx.putImageData(image, 0, 0);
+        ctx.drawImage(temp, 0, 0);
       }
     }
     resizeCanvasForHiDPI();
@@ -125,50 +139,97 @@
     canvas.addEventListener('touchmove', move, { passive: false });
     window.addEventListener('touchend', end);
 
-    clearBtn.addEventListener('click', () => {
+    function clearCanvas(msg = 'Canvas cleared.') {
       ctx.clearRect(0,0,canvas.width,canvas.height);
-      resultEl.textContent = 'Canvas cleared.';
+      resultEl.textContent = msg;
       resultEl.classList.remove('text-danger');
       resultEl.classList.add('text-muted');
+      previewSmall.src = '';
+    }
+
+    clearBtn.addEventListener('click', () => clearCanvas());
+    startWriteBtn.addEventListener('click', () => {
+      clearCanvas('Draw a letter in the pad below.');
+      canvas.scrollIntoView({ behavior: 'smooth', block: 'center' });
     });
+
+    // create a resized dataURL (useful to match model input). target 8x8
+    function getResizedDataURL(targetW = 8, targetH = 8) {
+      // draw current canvas onto a temporary canvas scaled to target size
+      const off = document.createElement('canvas');
+      off.width = targetW;
+      off.height = targetH;
+      const octx = off.getContext('2d');
+      // white background to ensure consistent inversion on server
+      octx.fillStyle = '#ffffff';
+      octx.fillRect(0, 0, targetW, targetH);
+      // draw scaled
+      octx.drawImage(canvas, 0, 0, targetW, targetH);
+      return off.toDataURL('image/png');
+    }
+
+    function showSmallPreview(dataURL) {
+      previewSmall.src = dataURL;
+    }
 
     // Submit to server via fetch; server should accept JSON {image: dataURL}
     const detectUrl = "{{ url_for('detect') }}";
 
     submitBtn.addEventListener('click', async () => {
       try {
-        // show loading state
+        // UI loading state
         submitBtn.disabled = true;
         submitBtn.textContent = 'Detecting...';
-        resultEl.textContent = 'Sending image to server...';
+        resultEl.textContent = 'Preparing image...';
+        resultEl.classList.remove('text-danger');
 
-        // get a trimmed/normalized image (optional: here we send full canvas)
-        const dataURL = canvas.toDataURL('image/png');
+        // prepare small image to send (reduces payload and matches model preprocessing)
+        const smallDataURL = getResizedDataURL(8, 8);
+        showSmallPreview(smallDataURL);
+        resultEl.textContent = 'Sending image to server...';
 
         const resp = await fetch(detectUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ image: dataURL })
+          body: JSON.stringify({ image: smallDataURL })
         });
 
         submitBtn.disabled = false;
         submitBtn.textContent = 'Submit for Detection';
 
+        const text = await resp.text();
+
         if (!resp.ok) {
-          const text = await resp.text();
-          resultEl.textContent = 'Server error: ' + resp.status + ' — ' + text;
+          // try to show JSON error if server returned JSON text
+          try {
+            const err = JSON.parse(text);
+            resultEl.textContent = 'Server error: ' + (err.error || JSON.stringify(err));
+          } catch (_) {
+            resultEl.textContent = 'Server error: ' + resp.status + ' — ' + text;
+          }
           resultEl.classList.add('text-danger');
           return;
         }
 
-        const json = await resp.json();
+        // Try parse JSON, otherwise accept plain text legacy response
+        let json = null;
+        try {
+          json = JSON.parse(text);
+        } catch (_) {
+          // server returned plain text prediction (legacy)
+          resultEl.innerHTML = `<strong>Letter:</strong> ${text}`;
+          resultEl.classList.remove('text-danger');
+          return;
+        }
+
         // expected JSON: { letter: 'A', confidence: 0.94 }
         if (json.letter !== undefined) {
-          const conf = (typeof json.confidence === 'number') ? (json.confidence * 100).toFixed(1) + '%' : json.confidence;
+          const conf = (typeof json.confidence === 'number') ? (json.confidence * 100).toFixed(1) + '%' : (json.confidence ?? 'n/a');
           resultEl.innerHTML = `<strong>Letter:</strong> ${json.letter} &nbsp; <small class="text-muted">Confidence: ${conf}</small>`;
           resultEl.classList.remove('text-danger');
         } else {
-          resultEl.textContent = 'Unexpected response from server.';
+          // if json is a plain value or structure, show it
+          resultEl.textContent = 'Unexpected response from server: ' + JSON.stringify(json);
           resultEl.classList.add('text-danger');
         }
       } catch (err) {
